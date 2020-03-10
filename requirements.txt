@@ -1,0 +1,1 @@
+dockerspawner>=0.11
