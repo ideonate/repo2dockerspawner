@@ -14,17 +14,9 @@ from docker.errors import APIError
 from tornado import gen
 
 from traitlets import (
-    Any,
-    Bool,
-    CaselessStrEnum,
-    Dict,
-    List,
     Int,
     Unicode,
-    Union,
-    default,
-    observe,
-    validate,
+    default
 )
 
 import jupyterhub
@@ -43,8 +35,23 @@ class Repo2DockerSpawner(DockerSpawner):
         """single global executor"""
         cls = self.__class__
         if cls._build_executor is None:
-            cls._build_executor = ThreadPoolExecutor(5)
+            cls._build_executor = ThreadPoolExecutor(self.concurrent_builds_limit)
         return cls._build_executor
+
+    build_image = Unicode(
+        "jupyter/repo2docker:0.11.0",
+        config=True,
+        help="""The repo2docker image to use for building new Docker images.""",
+        )
+
+    concurrent_builds_limit = Int(
+        20,
+        help="""
+        Number of threads to allocate globally for repo2docker builds.
+
+        If set to 0, the ThreadPoolExecutor default will be used.
+        """,
+    ).tag(config=True)
 
     log_generator = None
 
@@ -56,7 +63,7 @@ class Repo2DockerSpawner(DockerSpawner):
         <label for="use_r2d_yes">Start server from a repository</label> <br />
 
         <label for="repourl">Repo URL:</label>
-        <input type="text" name="repourl" value="" />
+        <input type="text" name="repourl" value="" style="width: 450px;" />
         
         </input>
         
@@ -116,7 +123,7 @@ class Repo2DockerSpawner(DockerSpawner):
 
         self.log_generator = MyLogGen()
 
-        r2d_image_name = "jupyter/repo2docker:0.10.0"
+        r2d_image_name = self.build_image
 
         self.log_generator.push(1, 'Creating repo2docker container {} for repo {} and ref {}'.format(r2d_image_name, repourl, ref))
 
@@ -329,40 +336,17 @@ class Repo2DockerSpawner(DockerSpawner):
             self._docker('pull', repo, tag)
 
     @gen.coroutine
-    def start(self, image=None, extra_create_kwargs=None, extra_host_config=None):
+    def start(self):
         """Start the single-user server in a docker container.
-
-        Additional arguments to create/host config/etc. can be specified
-        via .extra_create_kwargs and .extra_host_config attributes.
 
         If the container exists and `c.DockerSpawner.remove` is true, then
         the container is removed first. Otherwise, the existing containers
         will be restarted.
         """
 
-        if image:
-            self.log.warning("Specifying image via .start args is deprecated")
-            self.image = image
-        if extra_create_kwargs:
-            self.log.warning(
-                "Specifying extra_create_kwargs via .start args is deprecated"
-            )
-            self.extra_create_kwargs.update(extra_create_kwargs)
-        if extra_host_config:
-            self.log.warning(
-                "Specifying extra_host_config via .start args is deprecated"
-            )
-            self.extra_host_config.update(extra_host_config)
-
-        # image priority:
-        # 1. user options (from spawn options form)
-        # 2. self.image from config
-        image_option = self.user_options.get('image')
-        if image_option:
-            # save choice in self.image
-            self.image = yield self.check_image_whitelist(image_option)
-
         use_r2d = self.user_options.get('use_r2d')
+
+        old_pull_policy = self.pull_policy
 
         if use_r2d == 'yes':
 
@@ -371,81 +355,15 @@ class Repo2DockerSpawner(DockerSpawner):
 
             self.cmd = 'jupyterhub-singleuser'
 
-            #self.image = yield self.build_r2d(repourl, ref)
+            image_name = yield self.build_executor.submit(self.build_r2d, repourl, ref)
 
-            self.log.info('about to build future')
-
-            build_future = yield self.build_executor.submit(self.build_r2d, repourl, ref)
-            self.log.info(build_future)
-
-            #wait([build_future])
-            image_name = build_future #.result()
-            self.log.info(image_name)
+            self.log.debug('R2d returned image name {}'.format(image_name))
             self.image = image_name
 
-        else:
+            self.pull_policy = 'never' # Don't look for it on Docker Hub if for some reason it has disappeared
 
-            yield self.pull_image(self.image)
+        retval = yield super().start()
 
-        # Should be able to call super class here?
+        self.pull_policy = old_pull_policy
 
-        obj = yield self.get_object()
-        if obj and self.remove:
-            self.log.warning(
-                "Removing %s that should have been cleaned up: %s (id: %s)",
-                self.object_type,
-                self.object_name,
-                self.object_id[:7],
-            )
-            yield self.remove_object()
-
-            obj = None
-
-        if obj is None:
-            obj = yield self.create_object()
-            self.object_id = obj[self.object_id_key]
-            self.log.info(
-                "Created %s %s (id: %s) from image %s",
-                self.object_type,
-                self.object_name,
-                self.object_id[:7],
-                self.image,
-            )
-
-        else:
-
-            self.log.info(
-                "Found existing %s %s (id: %s)",
-                self.object_type,
-                self.object_name,
-                self.object_id[:7],
-            )
-            # Handle re-using API token.
-            # Get the API token from the environment variables
-            # of the running container:
-            for line in obj["Config"]["Env"]:
-                if line.startswith(("JPY_API_TOKEN=", "JUPYTERHUB_API_TOKEN=")):
-                    self.api_token = line.split("=", 1)[1]
-                    break
-
-        # TODO: handle unpause
-        self.log.info(
-            "Starting %s %s (id: %s)",
-            self.object_type,
-            self.object_name,
-            self.container_id[:7],
-        )
-
-        # start the container
-        yield self.start_object()
-
-        if hasattr(self, 'post_start_cmd') and self.post_start_cmd:
-            yield self.post_start_exec()
-
-        ip, port = yield self.get_ip_and_port()
-        if jupyterhub.version_info < (0, 7):
-            # store on user for pre-jupyterhub-0.7:
-            self.user.server.ip = ip
-            self.user.server.port = port
-        # jupyterhub 0.7 prefers returning ip, port:
-        return (ip, port)
+        return retval
