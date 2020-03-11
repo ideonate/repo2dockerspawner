@@ -19,10 +19,6 @@ from traitlets import (
     default
 )
 
-import jupyterhub
-
-_jupyterhub_xy = "%i.%i" % (jupyterhub.version_info[:2])
-
 
 class Repo2DockerSpawner(DockerSpawner):
     """A Spawner for JupyterHub that runs each user's server in a separate docker container
